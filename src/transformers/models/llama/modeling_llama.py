@@ -333,7 +333,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        task_vector: Optional[torch.Tensor] = None,  # add task_vector to funtion signature
+        task_vector: Optional[torch.Tensor] = None,  # add task_vector to function signature
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
@@ -616,7 +616,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    task_vector=task_vector, #pass task vector to each decoder layer
+                    task_vector=task_vector, # pass task vector to each decoder layer
                     **flash_attn_kwargs,
                 )
 
