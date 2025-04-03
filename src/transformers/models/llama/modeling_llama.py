@@ -333,10 +333,18 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        task_vector: Optional[torch.Tensor] = None,  # add task_vector to funtion signature
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        residual = hidden_states
 
+        # Inject task vector
+        if task_vector is not None:
+            # task_vector shape: (batch_size, num_task_tokens=1, hidden_dim)
+            assert task_vector.shape[0] == hidden_states.shape[0]
+            hidden_states = torch.cat([task_vector, hidden_states], dim=1)
+
+        residual = hidden_states
+        
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -358,7 +366,11 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-
+        
+        # Strip Off Task Vector From Output   
+        if task_vector is not None:
+            hidden_states = hidden_states[:, task_vector.shape[1]:, :]
+        
         outputs = (hidden_states,)
         if output_attentions:
             outputs += (self_attn_weights,)
@@ -527,6 +539,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        task_vector: Optional[torch.Tensor] = None,  # add task_vector to funtion signature
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -603,6 +616,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    task_vector=task_vector, #pass task vector to each decoder layer
                     **flash_attn_kwargs,
                 )
 
