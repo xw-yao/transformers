@@ -47,6 +47,14 @@ def ForCausalLMLoss(
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> torch.Tensor:
+    
+    # Debug shapes before any manipulation
+    # print(f"[DEBUG] labels.shape: {labels.shape}")
+
+    if logits.size(1) > labels.size(1):
+        print(f"[WARNING] Stripping logits: logits seq_len {logits.size(1)} > labels seq_len {labels.size(1)}")
+        logits = logits[:, -labels.size(1):, :]  # Keep the last `labels.size(1)` logits
+
     # Upcast to float if we need to compute the loss to avoid potential precision issues
     logits = logits.float()
 
@@ -54,6 +62,8 @@ def ForCausalLMLoss(
         # Shift so that tokens < n predict n
         labels = nn.functional.pad(labels, (0, 1), value=ignore_index)
         shift_labels = labels[..., 1:].contiguous()
+    
+    # print(f"[DEBUG] shift_labels.shape (after pad/shift): {shift_labels.shape}")
 
     # Flatten the tokens
     logits = logits.view(-1, vocab_size)

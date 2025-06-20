@@ -112,6 +112,7 @@ class LlamaRotaryEmbedding(nn.Module):
         2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
         """
         seq_len = torch.max(position_ids) + 1
+
         if seq_len > self.max_seq_len_cached:  # growth
             inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
             self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
@@ -126,6 +127,15 @@ class LlamaRotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def forward(self, x, position_ids):
+        seq_len = x.shape[-1]
+
+        if seq_len > self.inv_freq.shape[0]:
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, x.device)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.max_seq_len_cached = seq_len
+           
+            # print(f"[Rotary Fix] Reinitializing rotary cache: inv_freq was {self.inv_freq.shape[0]} → needs {seq_len}")
+
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 
@@ -144,6 +154,8 @@ class LlamaRotaryEmbedding(nn.Module):
         # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
+        
+        # print(f"[Rotary Forward] cos.shape = {cos.shape}, sin.shape = {sin.shape}, seq_len = {seq_len}")
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
@@ -272,13 +284,22 @@ class LlamaAttention(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+    
+        batch_size, seq_len, _ = hidden_states.shape
+        
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        # print(f"[DEBUG] LlamaAttention input hidden_states.shape = {hidden_states.shape}")
+        # print(f"[DEBUG] batch_size = {batch_size}, seq_len = {seq_len}")
+
+        query_states = self.q_proj(hidden_states).view(batch_size, seq_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(batch_size, seq_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(batch_size, seq_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         cos, sin = position_embeddings
+        
+        # print(f"[LlamaAttention] query_states.shape: {query_states.shape}")
+        # print(f"[LlamaAttention] cos.shape: {cos.shape}, sin.shape: {sin.shape}")
+        
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -310,6 +331,7 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
+    
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -337,14 +359,7 @@ class LlamaDecoderLayer(nn.Module):
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
-        # Inject task vector
-        if task_vector is not None:
-            # task_vector shape: (batch_size, num_task_tokens=1, hidden_dim)
-            assert task_vector.shape[0] == hidden_states.shape[0]
-            hidden_states = torch.cat([task_vector, hidden_states], dim=1)
-
         residual = hidden_states
-        
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
@@ -359,6 +374,9 @@ class LlamaDecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
+        
+        # print(f"[DEBUG] DecoderLayer: post-attn hidden_states.shape = {hidden_states.shape}")
+
         hidden_states = residual + hidden_states
 
         # Fully Connected
@@ -366,10 +384,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
-        # Strip Off Task Vector From Output   
-        if task_vector is not None:
-            hidden_states = hidden_states[:, task_vector.shape[1]:, :]
         
         outputs = (hidden_states,)
         if output_attentions:
@@ -563,7 +577,7 @@ class LlamaModel(LlamaPreTrainedModel):
             raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
 
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids) 
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
@@ -575,24 +589,38 @@ class LlamaModel(LlamaPreTrainedModel):
             )
 
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        )
-
-        hidden_states = inputs_embeds
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
+            position_ids = cache_position.unsqueeze(0)      
+        
+        hidden_states = inputs_embeds 
+       
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+ 
+        # for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+            
+            # Re-inject task vector at each layer
+            if task_vector is not None:
+                hidden_states = torch.cat([task_vector, hidden_states], dim=1)
+                if position_ids is not None:
+                    position_ids = torch.cat([torch.zeros_like(position_ids[:, :1]), position_ids], dim=1)
+                if attention_mask is not None:
+                    attention_mask = torch.cat([torch.ones_like(attention_mask[:, :1]), attention_mask], dim=1)
+            
+            # create position embeddings to be shared across the decoder layers
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+            # print(f"[DEBUG] [Layer {i}] hidden_states.shape: {hidden_states.shape}")
+            # print(f"[DEBUG] [Layer {i}] position_ids.shape: {position_ids.shape}")
+            # print(f"[DEBUG] [Layer {i}] attention_mask.shape: {attention_mask.shape}")
+            # print(f"[DEBUG] [Layer {i}] rotary_emb.inv_freq.shape: {self.rotary_emb.inv_freq.shape}")
+
+            causal_mask = self._update_causal_mask(
+            attention_mask, hidden_states, cache_position, past_key_values, output_attentions
+            )
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
@@ -622,6 +650,16 @@ class LlamaModel(LlamaPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            # Strip the task vector after each layer
+            if task_vector is not None:
+                hidden_states = hidden_states[:, task_vector.shape[1]:, :]
+                if position_ids is not None:
+                    position_ids = position_ids[:, task_vector.shape[1]:]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, task_vector.shape[1]:]
+            
+            # print(f"[DEBUG] After layer {i}: hidden_states.shape = {hidden_states.shape}")
+
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -641,12 +679,15 @@ class LlamaModel(LlamaPreTrainedModel):
 
     def _update_causal_mask(
         self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
         cache_position: torch.Tensor,
         past_key_values: Cache,
         output_attentions: bool = False,
     ):
+        # print(f"[DEBUG] cache_position is None? {cache_position is None}")
+        # if cache_position is not None:
+        #     print(f"[DEBUG] cache_position.shape = {cache_position.shape}")
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and (attention_mask == 0.0).any():
                 return attention_mask
@@ -667,14 +708,14 @@ class LlamaModel(LlamaPreTrainedModel):
         if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
                 attention_mask,
-                inputs_embeds=input_tensor,
+                inputs_embeds=hidden_states,
                 past_key_values_length=past_seen_tokens,
                 is_training=self.training,
             ):
                 return None
 
-        dtype, device = input_tensor.dtype, input_tensor.device
-        sequence_length = input_tensor.shape[1]
+        dtype, device = hidden_states.dtype, hidden_states.device
+        sequence_length = hidden_states.shape[1]
         if using_static_cache:
             target_length = past_key_values.get_max_cache_shape()
         else:
@@ -692,7 +733,7 @@ class LlamaModel(LlamaPreTrainedModel):
             dtype=dtype,
             device=device,
             cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
+            batch_size=hidden_states.shape[0],
         )
 
         if (
@@ -707,6 +748,8 @@ class LlamaModel(LlamaPreTrainedModel):
             min_dtype = torch.finfo(dtype).min
             causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
 
+        # print(f"[DEBUG] causal_mask.shape: {causal_mask.shape}")
+        
         return causal_mask
 
     @staticmethod
@@ -752,6 +795,13 @@ class LlamaModel(LlamaPreTrainedModel):
             )
             if sequence_length != 1:
                 causal_mask = torch.triu(causal_mask, diagonal=1)
+            # Patch cache_position to match sequence length if needed
+            if cache_position.shape[0] != sequence_length:
+                # print(f"[WARNING] cache_position.shape ({cache_position.shape}) != sequence_length ({sequence_length}), padding cache_position")
+                pad_len = sequence_length - cache_position.shape[0]
+                cache_position = torch.cat(
+                    [cache_position, torch.zeros(pad_len, dtype=cache_position.dtype, device=cache_position.device)]
+                )
             causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
             causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
             if attention_mask is not None:
