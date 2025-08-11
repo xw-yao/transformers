@@ -851,7 +851,101 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.model = decoder
 
     def get_decoder(self):
-        return self.model
+        return self.model    
+    
+    ########### Extend HF default to carry `task_vector` through generation steps.###############
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[Cache] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        task_vector: Optional[torch.Tensor] = None,   # <-- declare it
+        **model_kwargs,
+    ):
+        if past_key_values is not None:
+            # feed only last token
+            input_ids = input_ids[:, -1:]
+
+            # Recompute cache_position to match the step (length == current input len)
+            try:
+                past_seen_tokens = past_key_values.get_seq_length()
+            except AttributeError:
+                # Fallback for cache types without get_seq_length
+                # Infer from attention_mask if available
+                if attention_mask is not None:
+                    past_seen_tokens = attention_mask.shape[-1] - input_ids.shape[-1]
+                else:
+                    past_seen_tokens = 0
+
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + input_ids.shape[1],
+                device=input_ids.device,
+                dtype=torch.long,
+            )
+
+            # If you pass position_ids, keep them consistent (length 1 here)
+            if position_ids is not None:
+                position_ids = position_ids[:, -1:]
+            else:
+                # Most Llama impls derive position_ids from cache_position; this is safe
+                position_ids = cache_position.unsqueeze(0)
+
+
+        # build dict HF expects
+        out = {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "cache_position": cache_position,
+            # keep flags if present
+            "use_cache": model_kwargs.get("use_cache", getattr(self.config, "use_cache", True)),
+            "output_attentions": model_kwargs.get("output_attentions", False),
+            "output_hidden_states": model_kwargs.get("output_hidden_states", False),
+        }
+
+        # ensure task_vector is propagated every step
+        if task_vector is not None:
+            task_vector = task_vector.to(input_ids.device)
+            if task_vector.dim() == 2:
+                task_vector = task_vector.unsqueeze(1)  # [B,1,H]
+            if task_vector.size(0) != input_ids.size(0):
+                if task_vector.size(0) == 1:
+                    task_vector = task_vector.expand(input_ids.size(0), -1, -1)
+                else:
+                    raise ValueError(f"task_vector batch {task_vector.size(0)} != input batch {input_ids.size(0)}")
+            out["task_vector"] = task_vector
+        return out
+
+    def _expand_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        expand_size: int = 1,
+        is_encoder_decoder: bool = False,
+        **model_kwargs,
+    ):
+        # standard expand index
+        bsz = input_ids.shape[0]
+        idx = torch.arange(bsz, device=input_ids.device).view(-1, 1).repeat(1, expand_size).view(-1)
+
+        input_ids = input_ids.index_select(0, idx)
+
+        # expand common kwargs that are batch-shaped
+        for k in ("attention_mask", "position_ids", "cache_position"):
+            if k in model_kwargs and model_kwargs[k] is not None:
+                model_kwargs[k] = model_kwargs[k].index_select(0, idx)
+
+        # expand task_vector across beams
+        if "task_vector" in model_kwargs and model_kwargs["task_vector"] is not None:
+            tv = model_kwargs["task_vector"]
+            # tv is usually [B, T_tv(=1), H] or [B, 1, hidden_dim]
+            model_kwargs["task_vector"] = tv.index_select(0, idx)
+
+        return input_ids, model_kwargs
+    #############################################################################################
 
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
@@ -870,6 +964,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        task_vector: Optional[torch.Tensor] = None,   # <-- add task_vector
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -921,6 +1016,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            task_vector=task_vector,   # <-- add task_vector
             **kwargs,
         )
 
