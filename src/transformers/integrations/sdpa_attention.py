@@ -50,15 +50,64 @@ def sdpa_attention_forward(
     # We convert it to a bool for the SDPA kernel that only accepts bools.
     if torch.jit.is_tracing() and isinstance(is_causal, torch.Tensor):
         is_causal = is_causal.item()
+    
+    # -------------------------------
+    # (4) Flash fast-path detection
+    # -------------------------------
+    # Conditions where we can safely drop the mask and use is_causal=True:
+    #  - self-attention (Q,K,V same sequence length)
+    #  - batch size == 1 (no cross-example padding)
+    #  - no *real* padding present; masks seen are either:
+    #      * None
+    #      * all-True boolean mask
+    #      * square float additive mask (e.g., causal upper-tri with -inf), which we can replace
+    B = query.shape[0]
+    Lq = query.shape[-2]; Lk = key.shape[-2]; Lv = value.shape[-2]
+    same_len = (Lq == Lk == Lv)
+
+    def _is_trivial_bool_mask(t):
+        return (
+            t is not None
+            and torch.is_tensor(t)
+            and t.dtype == torch.bool
+            and t.ndim >= 2
+            and bool(t.all().item())
+        )
+
+    def _looks_like_additive_square_mask(t):
+        # float mask with shape [..., L, L]; typical for additive causal/padding masks
+        return (
+            t is not None
+            and torch.is_tensor(t)
+            and t.dtype.is_floating_point
+            and t.shape[-1] == t.shape[-2]
+        )
+
+    no_pad_and_causal_ok = (
+        B == 1
+        and same_len
+        and (
+            causal_mask is None
+            or _is_trivial_bool_mask(causal_mask)
+            or _looks_like_additive_square_mask(causal_mask)
+        )
+    )
+
+    # If conditions are met, drop the mask and set is_causal=True
+    attn_mask_arg = causal_mask
+    is_causal_arg = is_causal
+    if no_pad_and_causal_ok:
+        attn_mask_arg = None
+        is_causal_arg = True  # lets SDPA/Flash build the causal mask internally
 
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query,
         key,
         value,
-        attn_mask=causal_mask,
+        attn_mask=attn_mask_arg,
         dropout_p=dropout,
         scale=scaling,
-        is_causal=is_causal,
+        is_causal=is_causal_arg,
     )
     attn_output = attn_output.transpose(1, 2).contiguous()
 
