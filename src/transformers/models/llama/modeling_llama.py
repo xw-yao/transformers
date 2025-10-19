@@ -275,37 +275,90 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # shapes
         input_shape = hidden_states.shape[:-1]
-    
-        batch_size, seq_len, _ = hidden_states.shape    
+        batch_size, seq_len, _ = hidden_states.shape
 
-        # print(f"[DEBUG] LlamaAttention input hidden_states.shape = {hidden_states.shape}")
-        # print(f"[DEBUG] batch_size = {batch_size}, seq_len = {seq_len}")
-
-        query_states = self.q_proj(hidden_states).view(batch_size, seq_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(batch_size, seq_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(batch_size, seq_len, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+        # Projections: [B, T, H] -> [B, nH, T, Dh] (Q) / [B, nKV, T, Dh] (K,V)
+        query_states = self.q_proj(hidden_states).view(
+            batch_size, seq_len, self.config.num_attention_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(
+            batch_size, seq_len, self.config.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(
+            batch_size, seq_len, self.config.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
         cos, sin = position_embeddings
-        
-        # print(f"[LlamaAttention] query_states.shape: {query_states.shape}")
-        # print(f"[LlamaAttention] cos.shape: {cos.shape}, sin.shape: {sin.shape}")
-        
+
+        # --- Apply RoPE to TOKEN Q/K only (length == seq_len) ---
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        # --- Prefill detection (some caches exist but are "empty"); use seq length if available ---
+        def _past_len(pk):
+            try:
+                return int(pk.get_seq_length())
+            except Exception:
+                return 0
 
+        past_len = _past_len(past_key_value) if past_key_value is not None else 0
+        in_prefill = (past_len == 0)
+
+        # --- OPTIONAL KV prefix: task_vector (prefill only) ---
+        # Expect task_vector in kwargs as [B, 1, hidden_dim] or broadcastable to that
+        tv = kwargs.get("task_vector", None)
+        if in_prefill and (tv is not None):
+            tv = tv.to(hidden_states.device, dtype=hidden_states.dtype)
+            # Ensure shape [B, 1, H]
+            if tv.dim() == 2:
+                tv = tv.unsqueeze(1)  # [B, 1, H]
+            elif tv.dim() == 3:
+                pass  # [B, 1, H] expected
+            else:
+                raise ValueError(f"task_vector must be [B,1,H] or [B,H], got {tuple(tv.shape)}")
+
+            # Project TV to K/V and reshape to attention layout: [B, nKV, 1, Dh]
+            tv_k = self.k_proj(tv).view(batch_size, 1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+            tv_v = self.v_proj(tv).view(batch_size, 1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+            # NOTE: We do NOT run RoPE on tv_k/tv_v here; it is a learnable KV prefix slot.
+            # Concatenate as a single-position prefix along sequence dim
+            key_states   = torch.cat([tv_k, key_states], dim=2)    # [B, nKV, 1+T, Dh]
+            value_states = torch.cat([tv_v, value_states], dim=2)  # [B, nKV, 1+T, Dh]
+
+            # If we will write into cache, shift cache_position by +1 and insert tv at 0
+            if cache_position is not None:
+                # cache_position is typically 1D [T] or [B,T]; handle both
+                if cache_position.dim() == 1:
+                    # [T] -> [1+T], first pos for TV is 0, tokens become 1..T
+                    cache_position = torch.cat(
+                        [cache_position.new_zeros(1), cache_position + 1], dim=0
+                    )
+                elif cache_position.dim() == 2:
+                    # [B,T] -> [B,1+T]
+                    zeros = cache_position.new_zeros(cache_position.size(0), 1)
+                    cache_position = torch.cat([zeros, cache_position + 1], dim=1)
+                else:
+                    # Unexpected; leave as-is to avoid breaking
+                    pass
+
+        # ---- Update cache (handles both prefill and decode) ----
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+
+        # ---- Choose attention implementation ----
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to eager attention. "
+                    'You can set `attn_implementation="eager"` when loading the model to remove this warning.'
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -324,7 +377,6 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
-    
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -545,14 +597,12 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        task_vector: Optional[torch.Tensor] = None,  # <-- add task_vector
-        use_tv: bool = False,                        # <-- add toggle
+        task_vector: Optional[torch.Tensor] = None,  # keep interface
+        use_tv: bool = False,                        # kept for compat; not used here
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -560,9 +610,7 @@ class LlamaModel(LlamaPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
-            )
+            logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.")
             use_cache = False
 
         # TODO (joao): remove this exception in v4.56 -- it exists for users that try to pass a legacy cache
@@ -582,88 +630,94 @@ class LlamaModel(LlamaPreTrainedModel):
         device = hidden_states.device
 
         # -----------------------------
-        # PATCH: Normalize task_vector to [B,1,H]
+        # Normalize task_vector to [B,1,H] (no concat into hidden_states)
         # -----------------------------
         tv = None
-        tv_len = 0
         if task_vector is not None:
             tv = task_vector
             if tv.dim() == 1:               # [H] -> [1,1,H]
                 tv = tv.unsqueeze(0).unsqueeze(0)
-            elif tv.dim() == 2:             # [1,H] -> [1,1,H]
-                tv = tv.unsqueeze(1)
-            elif tv.dim() == 3:
-                pass                        # [B,1,H] or [1,1,H]
+            elif tv.dim() == 2:             # [1,H] or [B,H] -> [B,1,H] if B matches
+                if tv.size(0) == 1:
+                    tv = tv.unsqueeze(1)    # [1,1,H]
+                elif tv.size(0) == B:
+                    tv = tv.unsqueeze(1)    # [B,1,H]
+                else:
+                    raise ValueError(f"task_vector batch {tv.size(0)} != input batch {B}")
+            elif tv.dim() == 3:             # expect [B,1,H] or [1,1,H]
+                if tv.size(0) not in (1, B) or tv.size(1) != 1:
+                    raise ValueError(f"task_vector must be [B,1,H] or [1,1,H], got {tuple(tv.shape)}")
+                if tv.size(0) == 1 and B > 1:
+                    tv = tv.expand(B, -1, -1)
             else:
                 raise ValueError(f"Unexpected task_vector shape: {tuple(tv.shape)}")
 
             if tv.size(-1) != H:
                 raise ValueError(f"task_vector hidden_size {tv.size(-1)} != model hidden_size {H}")
 
-            if tv.size(0) == 1 and B > 1:
-                tv = tv.expand(B, -1, -1)   # [B,1,H]
             tv = tv.to(device=device, dtype=dtype)
             tv.requires_grad_(False)
-            tv_len = tv.size(1)             # usually 1
 
         # -----------------------------
-        # PATCH: Prefill-only injection gate
+        # Prefill detection (do NOT change hidden_states length)
         # -----------------------------
-        is_prefill = (past_key_values is None) or (past_key_values.get_seq_length() == 0)
-        should_inject = (tv_len > 0) and is_prefill and ((self.training is False) or use_tv)
+        def _past_len(pk):
+            try:
+                return int(pk.get_seq_length())
+            except Exception:
+                return 0
 
-        if should_inject:
-            # 1) prepend TV embedding
-            hidden_states = torch.cat([tv, hidden_states], dim=1)  # [B, 1+T, H]
-
-            # 2) extend attention_mask with ones for TV
-            if attention_mask is not None:
-                ones = torch.ones((B, tv_len), device=attention_mask.device, dtype=attention_mask.dtype)
-                attention_mask = torch.cat([ones, attention_mask], dim=1)  # [B, 1+T]
-
-            # (We will compute/shift positions below, after we know the final length)
+        past_len = _past_len(past_key_values) if past_key_values is not None else 0
+        in_prefill = (past_len == 0)
 
         # -----------------------------
-        # PATCH: (Re)compute cache_position and position_ids AFTER injection
-        # so lengths line up with hidden_states
+        # Positions / cache_position WITHOUT any TV length adjustments
         # -----------------------------
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
-                past_seen_tokens, past_seen_tokens + hidden_states.shape[1], device=hidden_states.device
-            )  # shape [S]
-        # If caller provided position_ids, we’ll use it; else default from cache_position
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)  # [1, S]
-        else:
-            # If we injected TV and caller provided position_ids (length T),
-            # shift by tv_len so query tokens keep their absolute offset,
-            # and create the TV position as 0..tv_len-1 implicitly via cache_position.
-            if should_inject:
-                position_ids = position_ids + tv_len  # shift tokens by +1
+                past_len, past_len + hidden_states.shape[1], device=hidden_states.device
+            )  # [T]
 
-        # decoder layers
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)  # [1, T]
+        # else: respect caller-provided position_ids as-is
+
+        # -----------------------------
+        # Decoder layers (no concat; pass tv only during prefill)
+        # -----------------------------
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        # -----------------------------
-        # IMPORTANT: Remove per-layer re-injection & strip.
-        # We never touch hidden_states with TV again—KV cache already contains the prefix.
-        # -----------------------------
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            # create position embeddings to be shared across the decoder layers
+            # rotary embeddings shared across layers
             position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
             causal_mask = self._update_causal_mask(
                 attention_mask, hidden_states, cache_position, past_key_values, output_attentions
             )
 
+            tv_for_layer = tv if in_prefill else None  # prefill only
+
             if self.gradient_checkpointing and self.training:
+                # IMPORTANT: include task_vector in kwargs for checkpointed path
+                def custom_forward(*inputs):
+                    return decoder_layer(
+                        inputs[0],  # hidden_states
+                        attention_mask=inputs[1],
+                        position_ids=inputs[2],
+                        past_key_value=inputs[3],
+                        output_attentions=inputs[4],
+                        use_cache=inputs[5],
+                        cache_position=inputs[6],
+                        position_embeddings=inputs[7],
+                        task_vector=tv_for_layer,
+                        **flash_attn_kwargs,
+                    )
                 layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+                    custom_forward,
                     hidden_states,
                     causal_mask,
                     position_ids,
@@ -683,7 +737,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    # PATCH: DO NOT pass task_vector into layers anymore
+                    task_vector=tv_for_layer,          # << pass TV ONLY in prefill
                     **flash_attn_kwargs,
                 )
 
@@ -705,7 +759,6 @@ class LlamaModel(LlamaPreTrainedModel):
             attentions=all_self_attns,
         )
         return output if return_dict else output.to_tuple()
-
 
     def _update_causal_mask(
         self,
@@ -891,53 +944,63 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        task_vector: Optional[torch.Tensor] = None,   # <-- declare it
+        task_vector: Optional[torch.Tensor] = None,
         **model_kwargs,
     ):
+        # Determine how many tokens are already in the cache
+        past_seen_tokens = 0
         if past_key_values is not None:
-            # feed only last token
-            input_ids = input_ids[:, -1:]
-
-            # Recompute cache_position to match the step (length == current input len)
             try:
-                past_seen_tokens = past_key_values.get_seq_length()
+                past_seen_tokens = int(past_key_values.get_seq_length())
             except AttributeError:
-                # Fallback for cache types without get_seq_length
-                # Infer from attention_mask if available
                 if attention_mask is not None:
-                    past_seen_tokens = attention_mask.shape[-1] - input_ids.shape[-1]
-                else:
-                    past_seen_tokens = 0
+                    # infer a best-effort estimate
+                    past_seen_tokens = attention_mask.shape[-1] - input_ids.shape[1]
+
+        # Are we in prefill (no tokens cached yet) or in decode?
+        in_decode = (past_seen_tokens > 0)
+
+        if in_decode:
+            # ---- DECODE path: feed only last token and DROP task_vector ----
+            input_ids = input_ids[:, -1:]
+            model_kwargs.pop("task_vector", None)
+            task_vector = None
 
             cache_position = torch.arange(
                 past_seen_tokens,
-                past_seen_tokens + input_ids.shape[1],
+                past_seen_tokens + input_ids.shape[1],   # usually +1
                 device=input_ids.device,
                 dtype=torch.long,
             )
 
-            # If you pass position_ids, keep them consistent (length 1 here)
+            # keep position_ids consistent with the step
             if position_ids is not None:
                 position_ids = position_ids[:, -1:]
             else:
-                # Most Llama impls derive position_ids from cache_position; this is safe
+                position_ids = cache_position.unsqueeze(0)
+        else:
+            # ---- PREFILL path: keep full input_ids; TV is allowed here ----
+            cache_position = torch.arange(
+                0,
+                input_ids.shape[1],
+                device=input_ids.device,
+                dtype=torch.long,
+            )
+            if position_ids is None:
                 position_ids = cache_position.unsqueeze(0)
 
-
-        # build dict HF expects
         out = {
             "input_ids": input_ids,
             "past_key_values": past_key_values,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "cache_position": cache_position,
-            # keep flags if present
             "use_cache": model_kwargs.get("use_cache", getattr(self.config, "use_cache", True)),
             "output_attentions": model_kwargs.get("output_attentions", False),
             "output_hidden_states": model_kwargs.get("output_hidden_states", False),
         }
 
-        # ensure task_vector is propagated every step
+        # Only attach TV on prefill (task_vector=None during decode)
         if task_vector is not None:
             task_vector = task_vector.to(input_ids.device)
             if task_vector.dim() == 2:
@@ -948,6 +1011,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
                 else:
                     raise ValueError(f"task_vector batch {task_vector.size(0)} != input batch {input_ids.size(0)}")
             out["task_vector"] = task_vector
+
         return out
 
     def _expand_inputs_for_generation(
