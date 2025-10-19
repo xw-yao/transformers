@@ -96,9 +96,11 @@ def sdpa_attention_forward(
     # If conditions are met, drop the mask and set is_causal=True
     attn_mask_arg = causal_mask
     is_causal_arg = is_causal
-    if no_pad_and_causal_ok:
-        attn_mask_arg = None
-        is_causal_arg = True  # lets SDPA/Flash build the causal mask internally
+    
+    # If there is NO mask at all, prefer causal fastpath for self-attention (prefill or decode)
+    # This covers qL==kL (prefill) and qL!=kL (decode) cases.
+    if attn_mask_arg is None:
+        is_causal_arg = True
 
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query,
